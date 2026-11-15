@@ -7,8 +7,8 @@
 A rollout engine that generates with its own tensor-parallel copy of the weights refreshes that copy after every
 optimizer step. Gathering each parameter whole and cutting out the local shard sends every parameter to every rank.
 Instead, each parameter is described twice with affine maps (:mod:`deepspeed.checkpoint.affine`): how the trainer
-stores it (:func:`zero_param_shaped_storage_map`; ``autotp_storage_affine_maps`` should serve for an AutoTP model,
-but that is not tested yet) and which block each inference rank needs (:func:`replicated_layout_map`).
+stores it (:func:`zero_param_shaped_storage_map`, or ``autotp_storage_affine_maps`` for an AutoTP model) and which
+block each inference rank needs (:func:`replicated_layout_map`).
 :func:`~deepspeed.checkpoint.affine_transfer.plan_transfers` composes the two into copies from trainer shards straight
 into inference shards, once per layout, and every sync runs the copies of all parameters as one
 :func:`~deepspeed.checkpoint.affine_transfer_executor.execute_transfers` batch.

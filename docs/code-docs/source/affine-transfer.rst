@@ -96,8 +96,8 @@ model refreshes that copy after every optimizer step.
 ``deepspeed.runtime.rollout.affine_weight_sync`` does it shard to shard: no
 rank gathers a whole parameter. Both sides are maps keyed by global rank, also
 when the copies run over a custom process group. The trainer side comes from
-``zero_param_shaped_storage_map`` (``autotp_storage_affine_maps`` should serve
-for an AutoTP model, but that is not tested yet). The inference side is a
+``zero_param_shaped_storage_map``, or from ``autotp_storage_affine_maps`` for
+an AutoTP model. The inference side is a
 tensor-parallel layout held by every replica, from
 ``replicated_layout_map``::
 

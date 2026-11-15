@@ -13,7 +13,7 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.checkpoint.affine import contiguous_split_map, replicated_map
 from deepspeed.checkpoint.affine_replica_policy import first_holder
 from deepspeed.checkpoint.affine_transfer_executor import AffineTransferExecutionError
-from deepspeed.checkpoint.zero_affine import zero_param_storage_shard
+from deepspeed.checkpoint.zero_affine import autotp_storage_affine_maps, zero_param_storage_shard
 from deepspeed.runtime.rollout.affine_weight_sync import (AffineWeightSync, WeightArena, replicated_layout_map,
                                                           zero_param_shaped_storage_map)
 from unit.common import DistributedTest
@@ -145,6 +145,78 @@ class TestAffineWeightSync(DistributedTest):
             assert second_address == first_address
             # Otherwise the second sync proves nothing about writing in place.
             assert not torch.equal(second_values, first_values)
+        engine.destroy()
+
+    # An AutoTP TP2 x DP2 trainer and one TP4 copy over the same four ranks, whose shards are uneven.
+    @pytest.mark.parametrize('zero_stage, zero_init', [(1, False), (2, False), (3, False), (3, True)])
+    def test_an_autotp_trainer_syncs_into_a_tp4_copy(self, zero_stage, zero_init):
+        dtype = torch.bfloat16 if get_accelerator().is_bf16_supported() else torch.float32
+        config = {
+            'train_micro_batch_size_per_gpu': 1,
+            'optimizer': {
+                'type': 'Adam',
+                'params': {
+                    'lr': 1e-2,
+                    'torch_adam': True
+                }
+            },
+            'zero_optimization': {
+                'stage': zero_stage
+            },
+            'tensor_parallel': {
+                'autotp_size': 2,
+                'partition_config': {
+                    'use_default_specs':
+                    False,
+                    'layer_specs': [
+                        {
+                            'patterns': [r'.*up\.weight$'],
+                            'partition_type': 'column'
+                        },
+                        {
+                            'patterns': [r'.*down\.weight$'],
+                            'partition_type': 'row'
+                        },
+                    ],
+                },
+            },
+        }
+        if dtype == torch.bfloat16:
+            config['bf16'] = {'enabled': True}
+        # Every rank builds the model from the same seed, as loading a checkpoint would give: the TP ranks must hold
+        # equal copies of the weights AutoTP leaves whole, and AutoTP checks that they see the same batch.
+        torch.manual_seed(0)
+        if zero_init:
+            # zero.Init partitions every parameter over the whole world, and the norm, which AutoTP leaves alone,
+            # keeps that partition.
+            with deepspeed.zero.Init(config_dict_or_path=config):
+                model = MLPBlock()
+        else:
+            model = MLPBlock()
+        engine, _, _, _ = deepspeed.initialize(model=model, model_parameters=model.parameters(), config=config)
+        params = dict(engine.module.named_parameters())
+        layouts = _layouts(4)
+        rank = dist.get_rank()
+
+        target_maps = {name: replicated_layout_map(layouts[name], [[0, 1, 2, 3]]) for name in params}
+        sync = AffineWeightSync(autotp_storage_affine_maps(engine.module), target_maps, dtype)
+        arena = WeightArena({name: layouts[name].shard_shapes[rank] for name in params}, dtype, engine.device)
+        for step in range(2):
+            if zero_stage == 3:
+                engine.empty_partition_cache()
+            sync.sync({name: zero_param_storage_shard(param) for name, param in params.items()}, dict(arena.items()))
+            # The full weights from the engine's own 16-bit consolidation, which gathers over ZeRO and TP and shares no
+            # code with the affine maps.
+            full = _all(engine._consolidated_16bit_state_dict())[0]
+            wrong = []
+            for name in params:
+                if not torch.equal(arena[name].cpu(), layouts[name].extract(full[name], rank)):
+                    wrong.append(name)
+            # Every rank fails together, rather than one rank failing while the others wait in the next collective.
+            assert _all(wrong) == [[]] * dist.get_world_size()
+            for x, y in random_dataloader(engine, 1, HIDDEN, engine.device, dtype):
+                engine.backward(engine(x, y))
+                engine.step()
         engine.destroy()
 
     @pytest.mark.parametrize('policy', ['default', 'first_holder'])
